@@ -1,0 +1,88 @@
+name: Publish TrainEveryDay to Beget
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: beget-production
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Upload static site over verified TLS
+        env:
+          FTP_HOST: ${{ secrets.BEGET_FTP_SERVER }}
+          FTP_USER: ${{ secrets.BEGET_FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.BEGET_FTP_PASSWORD }}
+        shell: python
+        run: |
+          import ftplib
+          import os
+          import pathlib
+          import ssl
+          import subprocess
+
+          for key in ("FTP_HOST", "FTP_USER", "FTP_PASSWORD"):
+              if not os.environ.get(key):
+                  raise SystemExit("Missing secret: " + key)
+          # This FTP account must be restricted to the site's public_html.
+          paths = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          files = []
+          for name in filter(None, paths):
+              path = pathlib.PurePosixPath(name)
+              if name == "README.md" or path.parts[0] == ".github":
+                  continue
+              if any(part.startswith(".") for part in path.parts) and name != ".htaccess":
+                  raise SystemExit("Unexpected hidden file: " + name)
+              if pathlib.Path(name).is_symlink():
+                  raise SystemExit("Symlinks are not published: " + name)
+              files.append(name)
+          if "index.html" not in files or not any(p.startswith("_next/") for p in files):
+              raise SystemExit("Static site is incomplete")
+          ftp = ftplib.FTP_TLS(context=ssl.create_default_context(), timeout=60)
+          ftp.connect(os.environ["FTP_HOST"], 21)
+          ftp.login(os.environ["FTP_USER"], os.environ["FTP_PASSWORD"])
+          ftp.prot_p()
+          ftp.cwd("/")
+          existing = set(ftp.nlst())
+          if not any(p.rstrip("/").split("/")[-1] == "index.html" for p in existing):
+              raise SystemExit("Wrong FTP root: existing index.html not found")
+          made = set()
+          # Assets first, main entrypoint last. No remote files are deleted.
+          for name in sorted(files, key=lambda p: (p == "index.html", p)):
+              parent = pathlib.PurePosixPath(name).parent
+              for directory in list(reversed(parent.parents)) + [parent]:
+                  d = str(directory)
+                  if d == "." or d in made:
+                      continue
+                  try:
+                      ftp.mkd(d)
+                  except ftplib.error_perm:
+                      ftp.cwd(d)
+                      ftp.cwd("/")
+                  made.add(d)
+              temporary = name + ".deploying"
+              with open(name, "rb") as source:
+                  ftp.storbinary("STOR " + temporary, source)
+              ftp.rename(temporary, name)
+          ftp.quit()
+          print("Published", len(files), "files without deleting existing files.")
+      - name: Verify public page
+        shell: python
+        run: |
+          import time
+          import urllib.request
+          url = "https://traineveryday.ru/?deploy=" + str(time.time_ns())
+          request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              page = response.read().decode("utf-8")
+          if "Макс" not in page or "TrainEveryDay" not in page:
+              raise SystemExit("Public page does not contain expected content")
+          print("Public page verified: https://traineveryday.ru")
