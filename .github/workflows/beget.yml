@@ -46,7 +46,16 @@ jobs:
               files.append(name)
           if "index.html" not in files or not any(p.startswith("_next/") for p in files):
               raise SystemExit("Static site is incomplete")
-          ftp = ftplib.FTP_TLS(context=ssl.create_default_context(), timeout=60)
+          class SessionReuseFTP(ftplib.FTP_TLS):
+              def ntransfercmd(self, cmd, rest=None):
+                  connection, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
+                  if self._prot_p:
+                      connection = self.context.wrap_socket(
+                          connection, server_hostname=self.host,
+                          session=self.sock.session)
+                  return connection, size
+
+          ftp = SessionReuseFTP(context=ssl.create_default_context(), timeout=60)
           ftp.connect(os.environ["FTP_HOST"], 21)
           ftp.login(os.environ["FTP_USER"], os.environ["FTP_PASSWORD"])
           ftp.prot_p()
